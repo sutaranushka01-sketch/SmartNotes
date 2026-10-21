@@ -6,14 +6,11 @@ let state = {
   subjectName: "",
   topicId: null,
   topicName: "",
-  questions: [],      // current quiz questions (no correct answers, from server)
+  questions: [],
   lastResult: null
 };
 
 // ================= DEMO DATA =================
-// Used automatically whenever the backend isn't reachable, so the app
-// always looks fully populated. Once your Spring Boot backend is running,
-// real data from MySQL takes over automatically instead.
 const DEMO = {
   subjects: [
     { subjectId: 1, subjectName: "Java" },
@@ -106,12 +103,12 @@ async function apiGet(path) {
   return res.json();
 }
 
-async function apiPost(path, body) {
+async function apiPost(path, body, timeoutMs = 1500) {
   const res = await fetch(API_BASE + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(1500)
+    signal: AbortSignal.timeout(timeoutMs)
   });
   if (!res.ok) throw new Error("POST " + path + " failed: " + res.status);
   return res.json();
@@ -134,7 +131,7 @@ async function loadSubjects() {
   try {
     subjects = await apiGet("/subjects");
   } catch (e) {
-    subjects = DEMO.subjects; // backend not reachable — show sample data
+    subjects = DEMO.subjects;
   }
   subjects.forEach(s => {
     const card = document.createElement("div");
@@ -219,7 +216,9 @@ async function loadTopicDetail() {
   notesEl.textContent = "Loading notes...";
   try {
     const notes = await apiGet("/notes/" + state.topicId);
-    notesEl.textContent = notes.length ? notes.map(n => n.content).join("\n\n") : (DEMO.notes[state.topicId] || "No notes added yet for this topic.");
+    notesEl.textContent = notes.length
+      ? notes.map(n => n.content).join("\n\n")
+      : (DEMO.notes[state.topicId] || "No notes added yet for this topic.");
   } catch (e) {
     notesEl.textContent = DEMO.notes[state.topicId] || "No notes added yet for this topic.";
   }
@@ -253,7 +252,218 @@ document.getElementById("addQuestionForm").addEventListener("submit", async (e) 
 });
 
 // ================= QUIZ =================
+// Generated quizzes use the rule-based Java QuizGeneratorService.
+// Do NOT call /questions/{topicId} here (that is for manually stored questions).
+
 document.getElementById("takeQuizBtn").addEventListener("click", loadQuiz);
+
+
+function getQuizCount() {
+  const selectors = [
+    "#quizCount", "#questionCount", "#numQuestions",
+    "#numberOfQuestions", 'input[name="count"]', 'input[name="questionCount"]'
+  ];
+  for (const selector of selectors) {
+    const el = document.querySelector(selector);
+    if (el && Number(el.value) > 0) return Math.min(30, Number(el.value));
+  }
+  return 8;
+}
+
+function getDifficulty() {
+  const selectors = [
+    "#difficulty", "#quizDifficulty", 'select[name="difficulty"]', 'input[name="difficulty"]'
+  ];
+  for (const selector of selectors) {
+    const el = document.querySelector(selector);
+    if (el && el.value) return String(el.value).toUpperCase();
+  }
+  return "ANY";
+}
+
+async function getNotesForQuiz() {
+  try {
+    const notes = await apiGet("/notes/" + state.topicId);
+    if (Array.isArray(notes) && notes.length) {
+      return notes.map(n => n.content || "").filter(Boolean).join("\n\n");
+    }
+  } catch (e) {
+    console.warn("Could not load notes from backend:", e);
+  }
+  return DEMO.notes[state.topicId] || "";
+}
+
+// ---- question type + answer handling ----
+
+const KNOWN_TYPES = ["MCQ", "TRUE_FALSE", "FILL_BLANK", "SHORT_ANSWER"];
+
+function normaliseType(type) {
+  const t = String(type || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[-\s]+/g, "_");
+
+  if (t === "MCQ" || t === "MULTIPLE_CHOICE" || t === "MULTIPLECHOICE") return "MCQ";
+  if (t === "TF" || t === "TRUE_FALSE" || t === "TRUEFALSE" || t === "TRUE_OR_FALSE") return "TRUE_FALSE";
+  if (t === "SHORT" || t === "SHORT_ANSWER" || t === "SHORTANSWER") return "SHORT_ANSWER";
+  if (t === "FILL" || t === "FILL_BLANK" || t === "FILLBLANK" || t === "FILL_IN_THE_BLANK") return "FILL_BLANK";
+  return "";
+}
+
+function typeFromElement(el) {
+  if (!el) return null;
+
+  const raw = [
+    el.dataset?.type,
+    el.dataset?.questionType,
+    el.dataset?.value,
+    el.value,
+    el.id,
+    el.getAttribute?.("data-value"),
+    el.textContent
+  ].filter(Boolean).join(" ").toLowerCase();
+
+  if (raw.includes("mcq") || raw.includes("multiple choice") || raw.includes("multiple_choice")) {
+    return "MCQ";
+  }
+  if (raw.includes("true_false") || raw.includes("true or false") || raw.includes("true/false") ||
+      raw.includes("true false") || raw === "tf" || raw.includes("truefalse")) {
+    return "TRUE_FALSE";
+  }
+  if (raw.includes("short_answer") || raw.includes("short answer") || raw.includes("shortanswer")) {
+    return "SHORT_ANSWER";
+  }
+  if (raw.includes("fill_blank") || raw.includes("fill in the blank") ||
+      raw.includes("fill-in-the-blank") || raw.includes("fillblank")) {
+    return "FILL_BLANK";
+  }
+  return null;
+}
+
+/*
+ * IMPORTANT:
+ * Do not infer a question's type from its question text or number of options.
+ * The backend is the source of truth. The selected UI type is sent to the
+ * backend, and the backend's returned type is rendered exactly as returned.
+ */
+function getSelectedQuizTypes() {
+  const selected = [];
+
+  // Normal checkbox/radio controls.
+  document.querySelectorAll(
+    'input[name="quizType"], input[name="quizTypes"], input[name="questionType"], ' +
+    'input[name="questionTypes"], input[data-question-type], input[data-type]'
+  ).forEach(el => {
+    if (el.checked) {
+      const type = typeFromElement(el);
+      if (type) selected.push(type);
+    }
+  });
+
+  // Buttons/cards used as type selectors.
+  document.querySelectorAll(
+    '[data-question-type].selected, [data-question-type].active, ' +
+    '[data-type].selected, [data-type].active, ' +
+    'button[aria-pressed="true"], [role="button"][aria-pressed="true"]'
+  ).forEach(el => {
+    const type = typeFromElement(el);
+    if (type) selected.push(type);
+  });
+
+  if (selected.length) return [...new Set(selected)];
+
+  // Multi/select dropdowns.
+  for (const select of document.querySelectorAll("select")) {
+    const looksLikeTypeSelect = /type|question/i.test(
+      `${select.id} ${select.name} ${select.className}`
+    );
+    if (!looksLikeTypeSelect) continue;
+
+    const values = Array.from(select.selectedOptions)
+      .map(typeFromElement)
+      .filter(Boolean);
+
+    if (values.length) return [...new Set(values)];
+  }
+
+  return [];
+}
+
+function prepareQuestion(q, index) {
+  const type = normaliseType(q?.type);
+
+  if (!KNOWN_TYPES.includes(type)) {
+    throw new Error(
+      `Backend returned an invalid question type: "${q?.type ?? ""}".`
+    );
+  }
+
+  const options = Array.isArray(q.options) ? q.options.filter(v => v != null && String(v).trim() !== "") : [];
+  let answer = q.answer ?? q.correctAnswer ?? "";
+
+  // Convert A/B/C/D answer letters to the actual option text.
+  if (type === "MCQ" && /^[A-D]$/i.test(String(answer).trim())) {
+    const optionIndex = String(answer).trim().toUpperCase().charCodeAt(0) - 65;
+    answer = options[optionIndex] ?? "";
+  }
+
+  // If the backend returns the answer text, make it match the actual option
+  // text/capitalisation exactly.
+  if (type === "MCQ" && answer) {
+    const matchingOption = options.find(
+      option => String(option).trim().toLowerCase() === String(answer).trim().toLowerCase()
+    );
+    if (matchingOption) answer = matchingOption;
+  }
+
+  if (type === "TRUE_FALSE") {
+    const a = String(answer).trim().toLowerCase();
+    if (a === "true") answer = "True";
+    else if (a === "false") answer = "False";
+  }
+
+  return {
+    ...q,
+    _index: index,
+    type,
+    options,
+    answer,
+    question: q.question ?? q.questionText ?? "",
+    sourceSentence: q.sourceSentence ?? ""
+  };
+}
+
+function validateGeneratedQuestion(q) {
+  if (!q.question || !String(q.question).trim()) {
+    return "A generated question has no question text.";
+  }
+
+  if (!q.answer || !String(q.answer).trim()) {
+    return `Question "${q.question}" has no correct answer.`;
+  }
+
+  if (q.type === "MCQ") {
+    if (q.options.length !== 4) {
+      return `MCQ must have exactly 4 options, but received ${q.options.length}.`;
+    }
+
+    const answerMatches = q.options.filter(
+      option => normaliseAnswer(option) === normaliseAnswer(q.answer)
+    );
+
+    if (answerMatches.length !== 1) {
+      return "MCQ correct answer is not exactly one of its four options.";
+    }
+  }
+
+  if (q.type === "TRUE_FALSE") {
+    if (!["True", "False"].includes(q.answer)) {
+      return "True/False question has an invalid correct answer.";
+    }
+  }
+
+  return null;
+}
 
 async function loadQuiz() {
   showView("quiz");
@@ -263,78 +473,291 @@ async function loadQuiz() {
     { label: state.topicName, onClick: loadTopicDetail },
     { label: "Quiz" }
   ]);
+
   const form = document.getElementById("quizForm");
-  form.innerHTML = "Loading questions...";
+  form.innerHTML = "<p>Generating your mixed quiz...</p>";
 
-  let questions;
-  try {
-    questions = await apiGet("/questions/" + state.topicId);
-    if (!questions.length) questions = DEMO.questions[state.topicId] || [];
-  } catch (e) {
-    questions = DEMO.questions[state.topicId] || [];
+  const submitButton = document.getElementById("submitQuizBtn");
+  if (submitButton) {
+    submitButton.disabled = false;
+    submitButton.textContent = "Submit Quiz";
   }
-  state.questions = questions;
 
-  document.getElementById("quizProgress").textContent =
-    questions.length + " question" + (questions.length === 1 ? "" : "s") + " — choose one answer each";
+  const count = getQuizCount();
+  const difficulty = getDifficulty();
+  const notes = await getNotesForQuiz();
 
-  if (questions.length === 0) {
+  if (!notes || notes.trim().split(/\s+/).length < 40) {
     form.innerHTML = "";
-    showEmpty("No questions added for this topic yet.");
+    showEmpty("Please add at least about 40 words of notes before generating a quiz.");
     return;
   }
 
-  form.innerHTML = "";
-  questions.forEach((q, idx) => {
-    const block = document.createElement("div");
-    block.className = "quiz-question";
-    block.innerHTML = `
-      <p class="qtext">${idx + 1}. ${escapeHtml(q.questionText)}</p>
-      ${["A","B","C","D"].map(opt => `
-        <label>
-          <input type="radio" name="q${q.questionId}" value="${opt}">
-          ${escapeHtml(q["option" + opt])}
-        </label>
-      `).join("")}
+  try {
+    // The backend always generates a mixed quiz:
+    // MCQ + True/False + Short Answer.
+    // Do not send selected question types from the UI.
+    const body = {
+      notes,
+      count,
+      difficulty
+    };
+
+    const generated = await apiPost("/quiz/generate", body, 15000);
+
+    if (!Array.isArray(generated)) {
+      throw new Error("Quiz generator returned an invalid response.");
+    }
+
+    console.log("Mixed quiz generated:", generated);
+
+    // The backend is the source of truth. Never infer/relabel the type.
+    const prepared = generated.map(prepareQuestion);
+
+    for (const q of prepared) {
+      const problem = validateGeneratedQuestion(q);
+
+      if (problem) {
+        throw new Error(problem);
+      }
+
+      if (!["MCQ", "TRUE_FALSE", "SHORT_ANSWER"].includes(q.type)) {
+        throw new Error(
+          `Unsupported generated question type: ${q.type}`
+        );
+      }
+    }
+
+    state.questions = prepared
+      .slice(0, count)
+      .map((q, i) => ({ ...q, _index: i }));
+
+    if (!state.questions.length) {
+      throw new Error("No usable questions were generated.");
+    }
+
+    document.getElementById("quizProgress").textContent =
+      state.questions.length +
+      " question" +
+      (state.questions.length === 1 ? "" : "s") +
+      " — answer each question";
+
+    renderGeneratedQuiz();
+
+  } catch (e) {
+    console.error("Quiz generation failed:", e);
+
+    form.innerHTML = `
+      <div class="quiz-error">
+        <strong>Could not generate the quiz.</strong>
+        <p>${escapeHtml(e.message || "Unknown error")}</p>
+        <button type="button" id="retryQuizBtn">Try Again</button>
+      </div>
     `;
+
+    document
+      .getElementById("retryQuizBtn")
+      ?.addEventListener("click", loadQuiz);
+  }
+}
+
+function renderGeneratedQuiz() {
+  const form = document.getElementById("quizForm");
+  form.innerHTML = "";
+
+  state.questions.forEach((q, idx) => {
+    const block = document.createElement("div");
+    block.className = "quiz-question generated-question";
+    block.dataset.index = idx;
+
+    const typeLabel = {
+      MCQ: "Multiple Choice",
+      TRUE_FALSE: "True / False",
+      SHORT_ANSWER: "Short Answer"
+    }[q.type] || "Question";
+
+    let answerArea = "";
+
+    if (q.type === "MCQ") {
+      answerArea = q.options.map((option, optionIndex) => `
+        <label class="quiz-option">
+          <input type="radio" name="generated-q-${idx}" value="${optionIndex}">
+          <span class="option-letter">${String.fromCharCode(65 + optionIndex)}</span>
+          <span>${escapeHtml(option)}</span>
+        </label>
+      `).join("");
+    } else if (q.type === "TRUE_FALSE") {
+      answerArea = ["True", "False"].map((option, optionIndex) => `
+        <label class="quiz-option">
+          <input type="radio" name="generated-q-${idx}" value="${optionIndex}">
+          <span class="option-letter">${optionIndex === 0 ? "T" : "F"}</span>
+          <span>${option}</span>
+        </label>
+      `).join("");
+    } else if (q.type === "FILL_BLANK") {
+      answerArea = `
+        <input
+          type="text"
+          class="fill-answer"
+          name="generated-q-${idx}"
+          placeholder="Type your answer here"
+          autocomplete="off"
+        >
+      `;
+    } else {
+      // SHORT_ANSWER, and a safe fallback so the answer area is never empty
+      answerArea = `
+        <textarea
+          class="short-answer"
+          name="generated-q-${idx}"
+          rows="3"
+          placeholder="Write your answer here..."
+        ></textarea>
+      `;
+    }
+
+    block.innerHTML = `
+      <div class="generated-type">${escapeHtml(typeLabel)}</div>
+      <p class="qtext">${escapeHtml(cleanQuestionText(q.question))}</p>
+      <div class="generated-answer-area">${answerArea}</div>
+      <div class="question-feedback hidden"></div>
+    `;
+
     form.appendChild(block);
   });
 }
 
-document.getElementById("submitQuizBtn").addEventListener("click", async () => {
-  const answers = state.questions.map(q => {
-    const selected = document.querySelector(`input[name="q${q.questionId}"]:checked`);
-    return {
-      questionId: q.questionId,
-      selectedOption: selected ? selected.value : ""
-    };
-  });
-
-  const unanswered = answers.filter(a => a.selectedOption === "").length;
-  if (unanswered > 0 && !confirm(unanswered + " question(s) left unanswered. Submit anyway?")) {
-    return;
+function getUserAnswer(q, index) {
+  if (q.type === "MCQ") {
+    const selected = document.querySelector(`input[name="generated-q-${index}"]:checked`);
+    if (!selected) return "";
+    const optionIndex = Number(selected.value);
+    return Number.isInteger(optionIndex) && q.options[optionIndex] !== undefined
+      ? q.options[optionIndex]
+      : "";
   }
 
-  const submission = {
-    studentId: Number(studentIdInput.value) || 1,
-    topicId: state.topicId,
-    answers
-  };
+  if (q.type === "TRUE_FALSE") {
+    const selected = document.querySelector(`input[name="generated-q-${index}"]:checked`);
+    if (!selected) return "";
+    return Number(selected.value) === 0 ? "True" : "False";
+  }
 
-  try {
-    const result = await apiPost("/quiz/submit", submission);
-    state.lastResult = result;
-    showResult(result);
-  } catch (e) {
-    // demo mode — fake a plausible score locally just for display purposes
-    const total = answers.length;
-    const answered = answers.filter(a => a.selectedOption !== "").length;
-    const demoScore = Math.max(1, Math.round(answered * 0.7));
-    showResult({
-      score: demoScore,
-      totalQuestions: total,
-      percentage: total ? (demoScore / total) * 100 : 0
+  const input = document.querySelector(`[name="generated-q-${index}"]`);
+  return input ? input.value.trim() : "";
+}
+
+function normaliseAnswer(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function shortAnswerCorrect(userAnswer, expectedAnswer) {
+  const user = normaliseAnswer(userAnswer);
+  const expected = normaliseAnswer(expectedAnswer);
+
+  if (!user || !expected) return false;
+  if (user === expected || expected.includes(user)) return true;
+
+  const stop = new Set([
+    "the", "a", "an", "is", "are", "was", "were", "of", "to", "and",
+    "in", "on", "for", "with", "that", "this", "it", "as", "by", "from"
+  ]);
+  const expectedWords = expected.split(/\s+/).filter(w => w.length > 2 && !stop.has(w));
+  const userWords = new Set(user.split(/\s+/).filter(w => w.length > 2 && !stop.has(w)));
+
+  if (!expectedWords.length || !userWords.size) return false;
+  const matches = expectedWords.filter(w => userWords.has(w)).length;
+  return matches / expectedWords.length >= 0.45;
+}
+
+function isAnswerCorrect(q, userAnswer) {
+  if (!userAnswer) return false;
+
+  if (q.type === "MCQ" || q.type === "TRUE_FALSE" || q.type === "FILL_BLANK") {
+    return normaliseAnswer(userAnswer) === normaliseAnswer(q.answer);
+  }
+
+  if (q.type === "SHORT_ANSWER") {
+    return shortAnswerCorrect(userAnswer, q.answer);
+  }
+
+  return false;
+}
+
+function revealAnswerForQuestion(block, q, correct) {
+  const feedback = block.querySelector(".question-feedback");
+  feedback.classList.remove("hidden");
+
+  if (correct) {
+    feedback.className = "question-feedback correct";
+    feedback.innerHTML = "✓ Correct!";
+  } else {
+    feedback.className = "question-feedback wrong";
+    feedback.innerHTML = `✗ Wrong. <strong>Correct answer:</strong> ${escapeHtml(q.answer)}`;
+  }
+
+  block.querySelectorAll(".quiz-option").forEach(label => {
+    label.classList.remove("selected-correct", "selected-wrong", "correct-option");
+  });
+
+  if (q.type === "MCQ" || q.type === "TRUE_FALSE") {
+    const selected = block.querySelector(`input[name="generated-q-${q._index}"]:checked`);
+    const selectedLabel = selected?.closest("label");
+    if (selectedLabel) {
+      selectedLabel.classList.add(correct ? "selected-correct" : "selected-wrong");
+    }
+
+    block.querySelectorAll(".quiz-option").forEach(label => {
+      const input = label.querySelector("input");
+      const optionIndex = Number(input?.value);
+      const optionText = q.type === "MCQ"
+        ? q.options[optionIndex]
+        : (optionIndex === 0 ? "True" : "False");
+      if (optionText && normaliseAnswer(optionText) === normaliseAnswer(q.answer)) {
+        label.classList.add("correct-option");
+      }
     });
+  }
+}
+
+document.getElementById("submitQuizBtn").addEventListener("click", () => {
+  if (!state.questions.length) return;
+
+  let score = 0;
+
+  state.questions.forEach((q, index) => {
+    const block = document.querySelector(`.generated-question[data-index="${index}"]`);
+    if (!block) return;
+
+    const userAnswer = getUserAnswer(q, index);
+    const correct = isAnswerCorrect(q, userAnswer);
+    if (correct) score++;
+
+    revealAnswerForQuestion(block, q, correct);
+
+    block.querySelectorAll("input, textarea").forEach(el => {
+      el.disabled = true;
+    });
+  });
+
+  const total = state.questions.length;
+  const percentage = total ? (score / total) * 100 : 0;
+
+  // Generated questions have no database IDs, so /quiz/submit is not called.
+  state.lastResult = { score, totalQuestions: total, percentage };
+
+  const submitButton = document.getElementById("submitQuizBtn");
+  if (submitButton) {
+    submitButton.disabled = true;
+    submitButton.textContent = `Score: ${score}/${total}`;
+  }
+
+  const progress = document.getElementById("quizProgress");
+  if (progress) {
+    progress.textContent = `Quiz checked — ${score}/${total} correct (${Math.round(percentage)}%)`;
   }
 });
 
@@ -382,7 +805,7 @@ async function loadHistory() {
   });
 }
 
-// ---- small helper to avoid raw HTML injection from notes/questions text ----
+// ---- helper to avoid raw HTML injection from notes/questions text ----
 function escapeHtml(str) {
   const div = document.createElement("div");
   div.textContent = str ?? "";

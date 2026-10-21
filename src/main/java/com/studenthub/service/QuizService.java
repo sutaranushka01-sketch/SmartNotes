@@ -63,7 +63,7 @@ public class QuizService {
         }
 
         // Step C: Calculate percentage and update the attempt record
-        double percentage = ((double) score / totalQuestions) * 100;
+        double percentage = totalQuestions == 0 ? 0 : ((double) score / totalQuestions) * 100;
         attempt.setScore(score);
         attempt.setPercentage(percentage);
         quizAttemptRepository.save(attempt);
@@ -71,14 +71,30 @@ public class QuizService {
         return new QuizResultDTO(attempt.getAttemptId(), score, totalQuestions, percentage);
     }
 
-    // ---- grading helpers -------------------------------------------------
     private boolean isAnswerCorrect(Question q, String given) {
-        if (given == null || given.isBlank()) return false;
-        if ("short".equals(q.getQuestionType())) {
-            return shortAnswerMatches(q.getCorrectAnswer(), given);
-        }
-        return q.getCorrectOption() != null && q.getCorrectOption().equalsIgnoreCase(given.trim());
+    if (given == null || given.isBlank()) return false;
+    String type = q.getQuestionType() == null ? "" : q.getQuestionType().trim().toUpperCase();
+
+    if (type.startsWith("SHORT")) {
+        return shortAnswerMatches(q.getCorrectAnswer(), given);
     }
+
+    String letter = q.getCorrectOption();
+    if (letter == null || letter.isBlank()) return false;
+    letter = letter.trim().toUpperCase();
+
+    String correctText = null;
+    switch (letter) {
+        case "A": correctText = q.getOptionA(); break;
+        case "B": correctText = q.getOptionB(); break;
+        case "C": correctText = q.getOptionC(); break;
+        case "D": correctText = q.getOptionD(); break;
+    }
+
+    String g = given.trim();
+    return g.equalsIgnoreCase(letter)
+            || (correctText != null && g.equalsIgnoreCase(correctText.trim()));
+}
 
     private static final java.util.Set<String> FILLER = java.util.Set.of(
             "a", "an", "the", "is", "are", "of", "to", "in", "it", "its", "and");
