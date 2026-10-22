@@ -30,7 +30,11 @@ public final class PosHelper {
 
     private static final Logger log = LoggerFactory.getLogger(PosHelper.class);
     private static final Pattern ALPHA = Pattern.compile("[A-Za-z][A-Za-z0-9]*");
+
+    /** Guards model loading only. */
     private static final Object LOCK = new Object();
+    /** Guards the (non-thread-safe) tagger and tokenizer while tagging. */
+    private static final Object TAG_LOCK = new Object();
 
     private static final Map<String, Tagged> CACHE = Collections.synchronizedMap(
             new LinkedHashMap<String, Tagged>(256, 0.75f, true) {
@@ -40,8 +44,8 @@ public final class PosHelper {
                 }
             });
 
-    private static POSTaggerME tagger;
-    private static boolean initDone;
+    private static volatile POSTaggerME tagger;
+    private static volatile boolean initDone;
 
     private PosHelper() {}
 
@@ -59,7 +63,7 @@ public final class PosHelper {
     // ------------------------------------------------------------------ loading
 
     public static boolean available() {
-        init();
+        if (!initDone) init();          // fast path: no lock once loaded
         return tagger != null;
     }
 
@@ -70,7 +74,6 @@ public final class PosHelper {
     private static void init() {
         synchronized (LOCK) {
             if (initDone) return;
-            initDone = true;
             try {
                 PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
                 String[] patterns = {
@@ -96,6 +99,8 @@ public final class PosHelper {
             } catch (Exception | LinkageError e) {
                 tagger = null;
                 log.warn("Could not load the OpenNLP POS model - using rule-only mode: {}", e.toString());
+            } finally {
+                initDone = true;        // set LAST, so other threads never see "done" before the tagger is set
             }
         }
     }
@@ -117,7 +122,7 @@ public final class PosHelper {
         if (cached != null) return cached;
         try {
             Tagged result;
-            synchronized (LOCK) {
+            synchronized (TAG_LOCK) {
                 String[] tokens = SimpleTokenizer.INSTANCE.tokenize(sentence);
                 if (tokens.length == 0) return null;
                 result = new Tagged(tokens, tagger.tag(tokens));
