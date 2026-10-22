@@ -11,10 +11,15 @@ import java.util.stream.Collectors;
 
 /**
  * Rule-based quiz generator (no AI). MCQ ONLY.
- * Steps: split sentences -> keep only real facts (no tasks / scenarios / code / examples / people)
- *        -> score keywords (TF-IDF style) -> score sentences -> order by difficulty
- *        -> build MCQs (definitions first) -> distractors taken from the SAME
- *        position in other sentences -> quality filter.
+ *
+ * Pipeline: split sentences -> keep only real facts -> score keywords (TF-IDF style)
+ *   -> pick the blanked term by DIFFICULTY (generic words like "data" are never blanked)
+ *   -> order sentences by difficulty -> build MCQs:
+ *        EASY   : definitions + obvious blanks, clearly different options
+ *        MEDIUM : less obvious blanks, related options, some "which statement is correct"
+ *        HARD   : specific blanks, look-alike options, many "which statement is correct"
+ *   -> distractors from the SAME slot / defined terms, with original casing (DBMS stays DBMS)
+ *   -> quality filter.
  */
 @Service
 public class QuizGeneratorService {
@@ -31,6 +36,17 @@ public class QuizGeneratorService {
             "here", "over", "under", "again", "once", "make", "makes", "made", "help", "helps",
             "means", "refers", "allows", "hides", "shows", "consists", "includes", "contains", "provides",
             "take", "takes", "user", "form", "forms", "ability", "wrapping", "reuse", "special", "single", "essential"));
+
+    /**
+     * Words so generic that blanking them tests nothing ("_____ is stored in a systematic way" -> "data").
+     * They are never chosen as the blanked answer (a defined term like "Data" is still allowed on EASY).
+     */
+    private static final Set<String> GENERIC_TERMS = new HashSet<>(Arrays.asList(
+            "data", "information", "system", "systems", "database", "databases", "software", "computer",
+            "computers", "application", "applications", "program", "programs", "method", "methods", "way",
+            "ways", "result", "results", "item", "items", "value", "values", "process", "number", "numbers",
+            "thing", "things", "example", "examples", "part", "parts", "type", "types", "kind", "set", "sets",
+            "name", "names", "level", "levels", "time", "place", "work", "step", "steps", "case", "cases"));
 
     private static final Pattern WORD = Pattern.compile("[A-Za-z][A-Za-z0-9\\-]*");
 
@@ -49,6 +65,13 @@ public class QuizGeneratorService {
             "if", "so", "since", "all", "every", "each", "some", "any", "many", "most", "more", "less",
             "other", "such", "easy", "very", "also", "then", "thus", "hence", "however", "therefore",
             "another", "given", "based", "completed", "entire", "large", "small", "new", "own"));
+
+    // Terms that may never be the blanked answer: fragments + generic words.
+    private static final Set<String> BAD_ANSWER_WORDS = new HashSet<>();
+    static {
+        BAD_ANSWER_WORDS.addAll(BAD_TERM_WORDS);
+        BAD_ANSWER_WORDS.addAll(GENERIC_TERMS);
+    }
 
     // Sentences that START with these are tasks/instructions ("Display departments..."), not facts.
     private static final Set<String> COMMAND_WORDS = new HashSet<>(Arrays.asList(
@@ -80,6 +103,10 @@ public class QuizGeneratorService {
                     + "sorts|joins|combines|selects|removes|adds|updates|deletes)\\b",
             Pattern.CASE_INSENSITIVE);
 
+    // All-caps words that are never a "topic" of the notes.
+    private static final Set<String> NOT_TOPICS = new HashSet<>(Arrays.asList(
+            "AND", "OR", "NOT", "NULL", "ID", "NO", "THE", "IS", "AS", "IN", "ON", "BY", "OF", "TO"));
+
     private static final String BLANK = "_____";
 
     private final Random random = new Random();
@@ -92,6 +119,8 @@ public class QuizGeneratorService {
         final Set<String> nouns = new HashSet<>();           // nouns found by the POS tagger (empty = no tagger)
         final Set<String> phrases = new HashSet<>();         // noun phrases such as "primary key"
         final Set<String> names = new HashSet<>();           // person names found in the notes (never used)
+        final Map<String, String> canon = new HashMap<>();   // lower-case -> original casing for acronyms (dbms -> DBMS)
+        String topic;                                        // most frequent acronym in the notes (e.g. "DBMS") or null
     }
 
     private static class Candidate {
@@ -159,6 +188,8 @@ public class QuizGeneratorService {
         Pool pool = new Pool();
         pool.sentences.addAll(sentences);
         pool.names.addAll(names);
+        buildCasing(sentences, pool);
+
         // With the POS tagger, wrong options are limited to real nouns / noun phrases.
         boolean pos = PosHelper.available();//part of speech
         if (pos) PosHelper.collectTerms(sentences, this::isValidWord, BAD_TERM_WORDS, pool.nouns, pool.phrases);
@@ -184,7 +215,7 @@ public class QuizGeneratorService {
             }
         }
 
-        List<Candidate> ranked = rankSentences(sentences, scores, names);//ranks sentences
+        List<Candidate> ranked = rankSentences(sentences, scores, names, level);//ranks sentences
         for (Candidate c : ranked) {              // definition terms make the best distractors
             if (c.isDefinition()) {
                 pool.words.add(c.defTerm);
@@ -250,6 +281,76 @@ public class QuizGeneratorService {
             for (int at = low.indexOf(phrase); at >= 0; at = low.indexOf(phrase, at + phrase.length())) count++;
         }
         return count;
+    }
+
+    // ------------------------------------------------------------------ casing + topic
+
+    /**
+     * Remembers how acronyms are written in the notes (dbms -> DBMS) so options never turn into "Dbms",
+     * and finds the notes' main acronym (used as context: "In DBMS, ...").
+     */
+    private void buildCasing(List<String> sentences, Pool pool) {
+        Set<String> plain = new HashSet<>();            // words seen in normal casing (lower / Capitalised)
+        Map<String, String> upperForm = new HashMap<>();
+        Map<String, Integer> acronymCount = new HashMap<>();
+        for (String s : sentences) {
+            for (String w : words(s)) {
+                String lw = w.toLowerCase();
+                if (upperCount(w) >= 2) {
+                    upperForm.putIfAbsent(lw, w);
+                    if (isAllCapsAcronym(w)) acronymCount.merge(w, 1, Integer::sum);
+                } else {
+                    plain.add(lw);
+                }
+            }
+        }
+        for (Map.Entry<String, String> e : upperForm.entrySet()) {
+            // "WHAT IS A DBMS" would wrongly make "what" an acronym, so skip words also seen in plain casing.
+            if (!plain.contains(e.getKey())) pool.canon.put(e.getKey(), e.getValue());
+        }
+        int best = 2;   // an acronym must occur at least 3 times to count as the topic
+        for (Map.Entry<String, Integer> e : acronymCount.entrySet()) {
+            if (NOT_TOPICS.contains(e.getKey()) || !pool.canon.containsKey(e.getKey().toLowerCase())) continue;
+            if (e.getValue() > best) { best = e.getValue(); pool.topic = e.getKey(); }
+        }
+    }
+
+    private int upperCount(String w) {
+        int n = 0;
+        for (int i = 0; i < w.length(); i++) if (Character.isUpperCase(w.charAt(i))) n++;
+        return n;
+    }
+
+    private boolean isAllCapsAcronym(String w) {
+        if (w.length() < 2 || w.length() > 6) return false;
+        for (int i = 0; i < w.length(); i++) if (!Character.isUpperCase(w.charAt(i))) return false;
+        return true;
+    }
+
+    /** Applies the notes' own casing to acronyms inside a term ("dbms schema" -> "DBMS schema"). */
+    private String canonical(String term, Pool pool) {
+        String[] tokens = term.split(" ");
+        for (int i = 0; i < tokens.length; i++) {
+            String fixed = pool.canon.get(tokens[i].toLowerCase());
+            if (fixed != null) tokens[i] = fixed;
+        }
+        return String.join(" ", tokens);
+    }
+
+    /** "In DBMS, " context prefix, or "" when there is no topic / it would leak or repeat the answer. */
+    private String topicPrefix(Pool pool, String sentence, String answer) {
+        if (pool.topic == null) return "";
+        if (sentence.toLowerCase().contains(pool.topic.toLowerCase())) return "";
+        if (answer != null && answer.toLowerCase().contains(pool.topic.toLowerCase())) return "";
+        return "In " + pool.topic + ", ";
+    }
+
+    private String upperFirst(String s) {
+        return s.isEmpty() ? s : Character.toUpperCase(s.charAt(0)) + s.substring(1);
+    }
+
+    private String lowerFirst(String s) {
+        return s.isEmpty() ? s : Character.toLowerCase(s.charAt(0)) + s.substring(1);
     }
 
     // ------------------------------------------------------------------ difficulty
@@ -321,6 +422,16 @@ public class QuizGeneratorService {
 
     private boolean isValidWord(String lowerWord) {
         return lowerWord.length() >= 3 && !STOP_WORDS.contains(lowerWord);
+    }
+
+    /** A word that may be the blanked answer: valid and not generic ("data", "system", ...). */
+    private boolean isAnswerWord(String lowerWord) {
+        return isValidWord(lowerWord) && !GENERIC_TERMS.contains(lowerWord);
+    }
+
+    /** True for a single generic word ("data"). Multi-word terms such as "database schema" are fine. */
+    private boolean isGenericTerm(String term) {
+        return wordCount(term) == 1 && GENERIC_TERMS.contains(term.trim().toLowerCase());
     }
 
     /** TF x IDF-style score: frequent words score high, words in every sentence score lower. */
@@ -398,34 +509,65 @@ public class QuizGeneratorService {
         return STATEMENT_VERB.matcher(t).find();
     }
 
-    private List<Candidate> rankSentences(List<String> sentences, Map<String, Double> scores, Set<String> names) {
+    /**
+     * Index of the blank among the sentence's terms ranked by score.
+     * EASY = the most central term, MEDIUM = the next one, HARD = a more specific one.
+     */
+    private int pickRank(String level, int size) {
+        if (size <= 1) return 0;
+        if (level.equals("HARD")) return Math.min(2, size - 1);
+        if (level.equals("MEDIUM")) return Math.min(1, size - 1);
+        return 0;
+    }
+
+    private List<Candidate> rankSentences(List<String> sentences, Map<String, Double> scores,
+                                          Set<String> names, String level) {
         List<Candidate> list = new ArrayList<>();
         Set<String> seenSentences = new HashSet<>();
+        final boolean pos = PosHelper.available();
         for (String s : sentences) {
             int wc = wordCount(s);
             if (wc < 6 || wc > 35 || !seenSentences.add(s.toLowerCase())) continue;
             if (!isStatement(s)) continue;   // skip tasks, scenarios, questions and code lines
             if (NameFilter.startsWithName(s, names)) continue;   // skip stories about people: "Amit is a student..."
 
-            double sum = 0, best = -1;
-            String bestWord = null;
+            // "It stores data..." / "This is used..." have no context on their own.
+            String firstWord = s.trim().split("\\s+")[0].toLowerCase().replaceAll("[^a-z]", "");
+            if (PRONOUNS.contains(firstWord)) continue;
+
+            double sum = 0;
+            List<String> termWords = new ArrayList<>();   // answer-worthy words of this sentence
+            Set<String> seenTerms = new HashSet<>();
             for (String w : words(s)) {
                 String lw = w.toLowerCase();
                 if (!isValidWord(lw)) continue;
                 if (names.contains(lw)) continue;   // a name is never the blanked term
-                double sc = scores.getOrDefault(lw, 0.0);
-                sum += sc;
-                if (sc > best) { best = sc; bestWord = w; }
+                sum += scores.getOrDefault(lw, 0.0);
+                if (isAnswerWord(lw) && seenTerms.add(lw)) termWords.add(w);
             }
-            if (bestWord == null) continue;
+            if (termWords.isEmpty()) continue;
+            termWords.sort((a, b) -> Double.compare(scores.getOrDefault(b.toLowerCase(), 0.0),
+                    scores.getOrDefault(a.toLowerCase(), 0.0)));
+
+            int rank = pickRank(level, termWords.size());
+            String bestWord = termWords.get(rank);
 
             // With the POS tagger the blank is a real noun / noun phrase (e.g. "primary key").
-            if (PosHelper.available()) {
-                String term = PosHelper.bestTerm(s, scores, this::isValidWord, BAD_TERM_WORDS);
+            if (pos) {
+                Map<String, Double> sc = scores;
+                if (rank > 0) {   // skip the most obvious term(s) of this sentence for harder levels
+                    sc = new HashMap<>(scores);
+                    for (int i = 0; i < rank; i++) sc.remove(termWords.get(i).toLowerCase());
+                }
+                String term = PosHelper.bestTerm(s, sc, w -> isAnswerWord(w), BAD_ANSWER_WORDS);
+                if (term == null && sc != scores) {
+                    term = PosHelper.bestTerm(s, scores, w -> isAnswerWord(w), BAD_ANSWER_WORDS);
+                }
                 if (term == null) continue;
                 bestWord = term;
             }
             if (NameFilter.isName(bestWord, names)) continue;   // the blanked term must not be a person
+            if (isGenericTerm(bestWord)) continue;              // never blank "data", "system", ...
 
             Candidate c = new Candidate();
             c.sentence = s;
@@ -436,8 +578,11 @@ public class QuizGeneratorService {
             if (m.matches()) {
                 String subject = m.group(1).trim();
                 String first = subject.split("\\s+")[0].toLowerCase();
+                // A definition of a generic word ("Data is ...") is fine for EASY, too trivial above that.
+                boolean genericOk = level.equals("EASY") || !isGenericTerm(subject);
                 if (wordCount(subject) <= 5 && !PRONOUNS.contains(first)
                         && !NameFilter.isName(subject, names)   // "Amit is ..." is not a definition
+                        && genericOk
                         && isGoodTerm(subject)
                         && wordCount(m.group(3).trim()) >= 5) {
                     c.defTerm = subject;
@@ -465,13 +610,21 @@ public class QuizGeneratorService {
 
     // ------------------------------------------------------------------ question builders
 
-    /** idx = position of the sentence after difficulty ordering; used only to alternate variants. */
+    /** idx = position of the sentence after difficulty ordering; used to mix question styles. */
     private QuizQuestion build(Type t, Candidate c, int idx, Pool pool, String level, boolean strict) {
         switch (t) {
             case FILL_BLANK:
                 return buildFillBlank(c, level);
             case MCQ: {
-                // Definition questions are the best ones, so they always come first.
+                // Medium/Hard: some "which statement is correct" questions (close options, harder to guess).
+                if (!level.equals("EASY")) {
+                    boolean statement = level.equals("HARD") ? idx % 2 == 0 : idx % 3 == 1;
+                    if (statement) {
+                        QuizQuestion sq = buildStatementMcq(c, pool, level);
+                        if (sq != null) return sq;
+                    }
+                }
+                // Definition questions are the best ones, so they come first.
                 if (c.isDefinition()) {
                     QuizQuestion q = buildDefinitionMcq(c, pool, level);
                     return q != null ? q : buildMcq(c, pool, level, strict);
@@ -530,13 +683,17 @@ public class QuizGeneratorService {
         if (!blanked.contains(BLANK) || blanked.indexOf(BLANK) != blanked.lastIndexOf(BLANK)) return null;
 
         // Enough context around the blank, and a real term (not a tiny word).
-        if (wordCount(blanked) < 7 || c.keyTerm.length() < 3) return null;
+        boolean easy = level.equals("EASY");
+        if (wordCount(blanked) < (easy ? 7 : 8) || c.keyTerm.length() < 3) return null;
+
+        // Above Easy, a short fragment whose blank is the opening subject ("_____ is stored safely") is too guessable.
+        if (!easy && blanked.startsWith(BLANK) && wordCount(blanked) < 10) return null;
 
         // Strict mode: wrong options must exist in the SAME slot elsewhere in the notes.
         // (With the POS tagger the options are already nouns, so this check is only needed without it.)
         if (strict && !PosHelper.available() && contextTerms(c.keyTerm, c.sentence, pool).isEmpty()) return null;
 
-        List<String> d = distractors(c.keyTerm, c.sentence, pool, 3, level);
+        List<String> d = distractors(c.keyTerm, c.sentence, pool, 3, level, true);
         if (d.size() < 3) return null;
         List<String> options = new ArrayList<>(d);
         options.add(c.keyTerm);
@@ -545,12 +702,15 @@ public class QuizGeneratorService {
         // The correct answer MUST be one of the displayed options.
         if (options.stream().noneMatch(o -> o.equalsIgnoreCase(c.keyTerm))) return null;
 
-        return new QuizQuestion(Type.MCQ, "Choose the option that best completes the sentence: " + blanked,
-                options, c.keyTerm, level, c.sentence);
+        String stem = topicPrefix(pool, c.sentence, c.keyTerm)
+                + (easy ? "choose the option that best completes the sentence: "
+                        : "which term best completes the sentence: ");
+        stem = upperFirst(stem);
+        return new QuizQuestion(Type.MCQ, stem + blanked, options, c.keyTerm, level, c.sentence);
     }
 
     private QuizQuestion buildDefinitionMcq(Candidate c, Pool pool, String level) {
-        List<String> d = distractors(c.defTerm, c.sentence, pool, 3, level);
+        List<String> d = distractors(c.defTerm, c.sentence, pool, 3, level, true);
         if (d.size() < 3) return null;
         List<String> options = new ArrayList<>(d);
         options.add(c.defTerm);
@@ -559,8 +719,48 @@ public class QuizGeneratorService {
         // The correct answer MUST be one of the displayed options.
         if (options.stream().noneMatch(o -> o.equalsIgnoreCase(c.defTerm))) return null;
 
-        String q = "Which term completes this definition? " + BLANK + " " + c.defVerb + " " + c.defRest;
+        String q;
+        if (level.equals("EASY")) {
+            q = "Which term completes this definition? " + BLANK + " " + c.defVerb + " " + c.defRest;
+        } else {
+            // Without "X is ..." the grammar no longer hints at the answer.
+            String rest = upperFirst(c.defRest);
+            if (!rest.endsWith(".")) rest = rest + ".";
+            q = "Which term is described by the following? " + rest;
+        }
         return new QuizQuestion(Type.MCQ, q, options, c.defTerm, level, c.sentence);
+    }
+
+    /**
+     * "Which statement is correct?" - the true sentence next to three copies where one key term is swapped.
+     * Options differ by a single term, so the student must really know the fact.
+     */
+    private QuizQuestion buildStatementMcq(Candidate c, Pool pool, String level) {
+        // Swapping a term only gives grammatical sentences when options are real nouns (needs the POS tagger).
+        if (!PosHelper.available()) return null;
+        String correct = c.sentence.trim();
+        if (c.keyTerm == null || wordCount(correct) < 8 || wordCount(correct) > 30) return null;
+        if (!termPattern(c.keyTerm).matcher(correct).find()) return null;
+
+        // Same-slot words could also be true there, so only use unrelated terms for swapped statements.
+        List<String> d = distractors(c.keyTerm, c.sentence, pool, 3, level, false);
+        if (d.size() < 3) return null;
+
+        LinkedHashSet<String> opts = new LinkedHashSet<>();
+        opts.add(correct);
+        for (String x : d) {
+            String wrong = swapTerm(correct, c.keyTerm, x);
+            if (!wrong.equals(correct)) opts.add(wrong);
+        }
+        if (opts.size() < 4) return null;
+
+        List<String> options = new ArrayList<>(opts);
+        Collections.shuffle(options, random);
+
+        String prefix = topicPrefix(pool, c.sentence, c.keyTerm);
+        String q = prefix.isEmpty() ? "Which of the following statements is correct?"
+                : prefix + "which of the following statements is correct?";
+        return new QuizQuestion(Type.MCQ, q, options, correct, level, c.sentence);
     }
 
     /** Not used while the quiz is MCQ-only; kept so the Type enum still compiles everywhere. */
@@ -569,7 +769,7 @@ public class QuizGeneratorService {
                 : level.equals("HARD") ? idx % 3 != 0
                 : idx % 2 == 1;
         if (makeFalse) {
-            List<String> d = distractors(c.keyTerm, c.sentence, pool, 1, level);
+            List<String> d = distractors(c.keyTerm, c.sentence, pool, 1, level, false);
             if (!d.isEmpty()) {
                 String falseStatement = swapTerm(c.sentence, c.keyTerm, d.get(0));
                 if (!falseStatement.equals(c.sentence)) {
@@ -628,17 +828,19 @@ public class QuizGeneratorService {
 
     /**
      * Wrong options, best first:
-     *  1. words from the same slot in other sentences (context terms)
+     *  1. words from the same slot in other sentences (context terms) - only if allowContext
      *  2. other defined terms from the notes
      *  3. other key terms
      * Options have the same number of words as the answer (relaxed only if there are too few).
      * Easy prefers options that look different from the answer; Medium/Hard prefer look-alikes.
+     * Casing follows the notes (DBMS stays DBMS) and matches the answer's style.
      */
-    private List<String> distractors(String answer, String sentence, Pool pool, int n, String level) {
+    private List<String> distractors(String answer, String sentence, Pool pool, int n, String level,
+                                     boolean allowContext) {
         String lowSentence = sentence.toLowerCase();
         String lowAnswer = answer.toLowerCase();
         int answerWords = wordCount(answer);
-        Set<String> contextual = contextTerms(answer, sentence, pool);
+        Set<String> contextual = allowContext ? contextTerms(answer, sentence, pool) : new LinkedHashSet<String>();
 
         List<String> all = new ArrayList<>(contextual);
         all.addAll(pool.words);
@@ -650,10 +852,11 @@ public class QuizGeneratorService {
         List<String> ordered = new ArrayList<>();
         for (boolean sameShape : new boolean[]{true, false}) {
             Set<String> seen = new HashSet<>();
+            seen.add(stem(answer));   // "Tables" is not a different option from "table"
             List<String> ctx = new ArrayList<>(), pref = new ArrayList<>(), other = new ArrayList<>();
             for (String p : all) {
                 String lp = p.toLowerCase();
-                if (lp.equals(lowAnswer) || !seen.add(lp)) continue;
+                if (lp.equals(lowAnswer) || !seen.add(stem(lp))) continue;
                 if (NameFilter.isName(p, pool.names)) continue;   // never a person's name
                 if (lowSentence.contains(lp) || lowAnswer.contains(lp) || lp.contains(lowAnswer)) continue;
                 if (sameShape && wordCount(p) != answerWords) continue;
@@ -682,19 +885,36 @@ public class QuizGeneratorService {
 
         List<String> out = new ArrayList<>();
         for (String p : top.subList(0, Math.min(n, top.size()))) {
-            out.add(matchCase(p, answer));
+            out.add(matchCase(canonical(p, pool), answer));
         }
         return out;
     }
 
-    /** Makes a wrong option look like the answer (same capitalisation) so the case does not give it away. */
-    private String matchCase(String option, String answer) {
-        if (option.isEmpty()) return option;
-        boolean acronym = option.length() > 1 && Character.isUpperCase(option.charAt(1));
-        if (Character.isUpperCase(answer.charAt(0))) {
-            return Character.toUpperCase(option.charAt(0)) + option.substring(1);
+    /** Crude stem so "table" and "tables" count as the same option. */
+    private String stem(String term) {
+        String t = term.trim().toLowerCase();
+        if (t.length() > 4 && t.endsWith("ies")) return t.substring(0, t.length() - 3) + "y";
+        if (t.length() > 4 && t.matches(".*(s|x|z|ch|sh)es$")) return t.substring(0, t.length() - 2);
+        if (t.length() > 3 && t.endsWith("s")) return t.substring(0, t.length() - 1);
+        return t;
+    }
+
+    /** True if any word of the option is an acronym / mixed-case word such as "DBMS" or "iOS". */
+    private boolean isAcronymLike(String option) {
+        for (String token : option.split(" ")) {
+            if (upperCount(token) >= 2) return true;
         }
-        return acronym ? option : Character.toLowerCase(option.charAt(0)) + option.substring(1);
+        return false;
+    }
+
+    /**
+     * Makes a wrong option look like the answer (same capitalisation) so the case does not give it away.
+     * Acronyms keep the notes' own casing, so "DBMS" never becomes "Dbms".
+     */
+    private String matchCase(String option, String answer) {
+        if (option.isEmpty() || answer.isEmpty()) return option;
+        if (isAcronymLike(option)) return option;
+        return Character.isUpperCase(answer.charAt(0)) ? upperFirst(option) : lowerFirst(option);
     }
 
     private boolean isGood(QuizQuestion q) {
@@ -717,6 +937,12 @@ public class QuizGeneratorService {
                             o.trim().equalsIgnoreCase(q.getAnswer().trim()));
 
             if (!answerPresent) return false;
+
+            // Options that differ only by case are duplicates in disguise.
+            Set<String> lower = new HashSet<>();
+            for (String o : q.getOptions()) {
+                if (o == null || !lower.add(o.trim().toLowerCase())) return false;
+            }
 
             // The blank should not reveal the answer.
             return !q.getQuestion().toLowerCase()

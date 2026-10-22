@@ -200,7 +200,7 @@ public class StudyToolsService {
         for (Sent s : rest) {
             if (cards.size() >= max) break;
             if (usedSentences.contains(s.text)) continue;
-            String front = "Explain what your notes say about \"" + capitalize(s.keyTerm.toLowerCase()) + "\".";
+            String front = "What is \"" + capitalize(s.keyTerm.toLowerCase()) + "\"?";
             if (!usedFronts.add(front.toLowerCase())) {
                 // same key term already used: fall back to a fill-the-term question for this sentence
                 String blanked = blank(s.text, s.keyTerm);
