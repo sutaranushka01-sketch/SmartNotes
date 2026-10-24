@@ -11,7 +11,7 @@ public class Notes {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Integer notesId;
 
-    @Column(columnDefinition = "TEXT")
+    @Column(columnDefinition = "LONGTEXT")
     private String content;
 
     @ManyToOne

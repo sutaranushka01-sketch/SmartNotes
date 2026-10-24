@@ -33,12 +33,13 @@ public class NotesController {
 
     // Add notes as plain text (typed or pasted)
     @PostMapping("/{topicId}")
-    public Notes addNotes(@PathVariable Integer topicId, @RequestBody Notes notes) {
-        Topic topic = topicRepository.findById(topicId)
-                .orElseThrow(() -> new RuntimeException("Topic not found"));
-        notes.setTopic(topic);
-        return notesRepository.save(notes);
-    }
+public Map<String, String> addNotes(@PathVariable Integer topicId, @RequestBody Notes notes) {
+    Topic topic = topicRepository.findById(topicId)
+            .orElseThrow(() -> new RuntimeException("Topic not found"));
+    notes.setTopic(topic);
+    notesRepository.save(notes);
+    return Map.of("message", "saved");
+}
 
     // Add notes by uploading a PDF — text is extracted AND saved against a topic
     @PostMapping("/upload-pdf/{topicId}")
