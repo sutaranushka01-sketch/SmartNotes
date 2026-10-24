@@ -1,10 +1,14 @@
 package com.studenthub.model;
 
-import jakarta.persistence.*;
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import jakarta.persistence.*;
+
+import java.util.ArrayList;
+import java.util.List;
 
 @Entity
-@Table(name = "topic")
+@JsonIgnoreProperties({"hibernateLazyInitializer", "handler"})
 public class Topic {
 
     @Id
@@ -13,12 +17,17 @@ public class Topic {
 
     private String topicName;
 
-    @ManyToOne
-    @JoinColumn(name = "subject_id")
     @JsonIgnore
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "subject_id")
     private Subject subject;
 
-    // Getters and Setters
+    @JsonIgnore
+    @OneToMany(mappedBy = "topic")
+    private List<Notes> notes = new ArrayList<>();
+
+    public Topic() {}
+
     public Integer getTopicId() { return topicId; }
     public void setTopicId(Integer topicId) { this.topicId = topicId; }
 
@@ -27,4 +36,7 @@ public class Topic {
 
     public Subject getSubject() { return subject; }
     public void setSubject(Subject subject) { this.subject = subject; }
+
+    public List<Notes> getNotes() { return notes; }
+    public void setNotes(List<Notes> notes) { this.notes = notes; }
 }

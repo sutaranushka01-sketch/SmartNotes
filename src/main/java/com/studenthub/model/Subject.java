@@ -1,10 +1,14 @@
 package com.studenthub.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import jakarta.persistence.*;
+
+import java.util.ArrayList;
 import java.util.List;
 
 @Entity
-@Table(name = "subject")
+@JsonIgnoreProperties({"hibernateLazyInitializer", "handler"})
 public class Subject {
 
     @Id
@@ -13,10 +17,12 @@ public class Subject {
 
     private String subjectName;
 
-    @OneToMany(mappedBy = "subject", cascade = CascadeType.ALL)
-    private List<Topic> topics;
+    @JsonIgnore
+    @OneToMany(mappedBy = "subject")
+    private List<Topic> topics = new ArrayList<>();
 
-    // Getters and Setters
+    public Subject() {}
+
     public Integer getSubjectId() { return subjectId; }
     public void setSubjectId(Integer subjectId) { this.subjectId = subjectId; }
 
